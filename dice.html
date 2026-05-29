@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>真實空間物理骰子盒 (極限零摩擦版)</title>
+    <title>3D 重力骰子</title>
     <style>
         body {
             margin: 0;
@@ -33,26 +33,25 @@
             transition: opacity 0.5s;
         }
         button {
-            padding: 18px 45px;
-            font-size: 22px;
+            padding: 15px 40px;
+            font-size: 20px;
             font-weight: bold;
             color: #fff;
-            background-color: #34495e; /* 換成低調冷靜的深鐵灰色，呼應冰上滑動感 */
+            background-color: #e74c3c;
             border: none;
-            border-radius: 40px;
+            border-radius: 30px;
             cursor: pointer;
-            box-shadow: 0 6px 10px rgba(0,0,0,0.4);
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
             transition: transform 0.1s, background-color 0.2s;
-            border: 2px solid #00cec9;
         }
         button:active {
             transform: scale(0.95);
-            background-color: #2c3e50;
+            background-color: #c0392b;
         }
         #instruction-text {
             font-size: 16px;
             margin-top: 20px;
-            color: #ecf0f1;
+            color: #bdc3c7;
             line-height: 1.6;
             max-width: 80%;
         }
@@ -64,12 +63,11 @@
 <body>
 
     <div id="ui-layer">
-        <h2>極限零摩擦骰子盒</h2>
-        <button id="start-btn">啟用感測器</button>
+        <h2>3D 重力骰子</h2>
+        <button id="start-btn">點擊開始</button>
         <div id="instruction-text">
-            <b>【冰面滑動模式】</b><br><br>
-            摩擦力已調至極限低 (0.01)！<br>
-            現在稍微傾斜手機，骰子就會像在冰面上瘋狂滑動與自轉！
+            向上甩動手機可拋擲骰子<br>
+            傾斜與翻轉手機控制滾動方向
         </div>
     </div>
 
@@ -129,15 +127,10 @@
             world.solver.iterations = 10;
 
             const standardMaterial = new CANNON.Material('standard');
-            
-            // ✅ 極限修改 1：摩擦力逼近 0，反彈係數微調保持動能
             const contactMaterial = new CANNON.ContactMaterial(
                 standardMaterial,
                 standardMaterial,
-                { 
-                    friction: 0.01,     // 極限低摩擦 (原本0.1)
-                    restitution: 0.5    // 稍微提高反彈，讓它更活潑
-                } 
+                { friction: 0.01, restitution: 0.5 } 
             );
             world.addContactMaterial(contactMaterial);
 
@@ -192,9 +185,8 @@
                 1 / diceBody.inertia.z
             );
 
-            // ✅ 極限修改 2：空氣與旋轉阻尼幾乎歸零
-            diceBody.angularDamping = 0.05;  // 降低旋轉阻尼 (原本0.1)
-            diceBody.linearDamping = 0.005;  // 降低滑行阻尼 (原本0.01)
+            diceBody.angularDamping = 0.05;  
+            diceBody.linearDamping = 0.005;  
             world.addBody(diceBody);
 
             window.addEventListener('resize', onWindowResize);
@@ -386,7 +378,6 @@
                 try {
                     const motionPerm = await DeviceMotionEvent.requestPermission();
                     if (motionPerm === 'granted') window.addEventListener('devicemotion', handleMotion);
-                    else alert("加速度權限遭拒，無法使用甩動。");
                 } catch (e) { console.error("運動權限遭拒", e); }
             } else {
                 window.addEventListener('devicemotion', handleMotion);
@@ -399,4 +390,3 @@
     </script>
 </body>
 </html>
-
