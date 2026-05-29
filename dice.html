@@ -83,6 +83,8 @@
         let diceMesh, diceBody;
         let lastTime;
         let isGameStarted = false;
+        
+        let wallMaterial; 
 
         const cameraY = 22;      
         const boxDepth = 8;      
@@ -126,13 +128,25 @@
             world.broadphase = new CANNON.NaiveBroadphase();
             world.solver.iterations = 10;
 
-            const standardMaterial = new CANNON.Material('standard');
-            const contactMaterial = new CANNON.ContactMaterial(
-                standardMaterial,
-                standardMaterial,
-                { friction: 0.01, restitution: 0.5 } 
+            const diceMaterial = new CANNON.Material('dice');
+            const floorCeilingMaterial = new CANNON.Material('floorCeiling');
+            wallMaterial = new CANNON.Material('wall');
+
+            // 1. 骰子與 (底板/玻璃面) 的接觸設定：摩擦力改為 0.005
+            const diceFloorContact = new CANNON.ContactMaterial(
+                diceMaterial,
+                floorCeilingMaterial,
+                { friction: 0.005, restitution: 0.55 } 
             );
-            world.addContactMaterial(contactMaterial);
+            world.addContactMaterial(diceFloorContact);
+
+            // 2. 骰子與 (四邊螢幕牆壁) 的接觸設定：摩擦力 0
+            const diceWallContact = new CANNON.ContactMaterial(
+                diceMaterial,
+                wallMaterial,
+                { friction: 0.0, restitution: 0.55 } 
+            );
+            world.addContactMaterial(diceWallContact);
 
             const planeGeometry = new THREE.PlaneGeometry(100, 100);
             const planeMaterial = new THREE.MeshStandardMaterial({ color: '#1e272e', roughness: 0.9 });
@@ -141,18 +155,18 @@
             planeMesh.receiveShadow = true;
             scene.add(planeMesh);
 
-            const groundBody = new CANNON.Body({ mass: 0, material: standardMaterial });
+            const groundBody = new CANNON.Body({ mass: 0, material: floorCeilingMaterial });
             groundBody.addShape(new CANNON.Plane());
             groundBody.quaternion.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), -Math.PI / 2);
             world.addBody(groundBody);
 
-            const ceilingBody = new CANNON.Body({ mass: 0, material: standardMaterial });
+            const ceilingBody = new CANNON.Body({ mass: 0, material: floorCeilingMaterial });
             ceilingBody.addShape(new CANNON.Plane());
             ceilingBody.quaternion.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), Math.PI / 2); 
             ceilingBody.position.set(0, boxDepth, 0);
             world.addBody(ceilingBody);
 
-            updateWallas(standardMaterial);
+            updateWallas(wallMaterial);
 
             const diceSize = 1.0; 
             const cornerRadius = 0.15; 
@@ -168,7 +182,7 @@
             diceMesh.castShadow = true;
             scene.add(diceMesh);
 
-            diceBody = new CANNON.Body({ mass: 1, material: standardMaterial });
+            diceBody = new CANNON.Body({ mass: 1, material: diceMaterial });
             diceBody.addShape(new CANNON.Box(new CANNON.Vec3(diceSize / 2, diceSize / 2, diceSize / 2)));
             diceBody.position.set(0, 1.5, 0); 
             
@@ -188,6 +202,16 @@
             diceBody.angularDamping = 0.05;  
             diceBody.linearDamping = 0.005;  
             world.addBody(diceBody);
+
+            diceBody.addEventListener('collide', function(e) {
+                if (!navigator.vibrate) return;
+                const impactVelocity = Math.abs(e.contact.getImpactVelocityAlongNormal());
+                if (impactVelocity > 15.0) {
+                    navigator.vibrate(40);
+                } else if (impactVelocity > 2.0) {
+                    navigator.vibrate(10);
+                }
+            });
 
             window.addEventListener('resize', onWindowResize);
 
@@ -337,8 +361,7 @@
             camera.aspect = window.innerWidth / window.innerHeight;
             camera.updateProjectionMatrix();
             renderer.setSize(window.innerWidth, window.innerHeight);
-            const standardMaterial = world.getContactMaterial(world.defaultMaterial, world.defaultMaterial);
-            updateWallas(standardMaterial);
+            updateWallas(wallMaterial);
         }
 
         function animate() {
@@ -390,3 +413,4 @@
     </script>
 </body>
 </html>
+
