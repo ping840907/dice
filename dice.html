@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>3D 重力感應物理骰子</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #2c3e50;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #ui-layer {
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 100%;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            background-color: rgba(0, 0, 0, 0.7);
+            z-index: 10;
+            color: white;
+            text-align: center;
+        }
+        button {
+            padding: 15px 40px;
+            font-size: 20px;
+            font-weight: bold;
+            color: #fff;
+            background-color: #e74c3c;
+            border: none;
+            border-radius: 30px;
+            cursor: pointer;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+            transition: transform 0.1s, background-color 0.2s;
+        }
+        button:active {
+            transform: scale(0.95);
+            background-color: #c0392b;
+        }
+        p { font-size: 14px; margin-top: 15px; color: #bdc3c7; }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js"></script>
+</head>
+<body>
+
+    <div id="ui-layer">
+        <h2>3D 重力感應骰子</h2>
+        <button id="start-btn">點擊開始 & 啟用陀螺儀</button>
+        <p>點擊螢幕可拋擲骰子<br>傾斜手機改變重力方向</p>
+    </div>
+
+    <div id="canvas-container"></div>
+
+    <script>
+        let scene, camera, renderer, world;
+        let diceMesh, diceBody;
+        let lastTime;
+
+        // 螢幕邊界的物理牆壁
+        const wallBodies = [];
+
+        // 初始化
+        function init() {
+            // ================= 1. 初始化 Three.js (視覺世界) =================
+            const container = document.getElementById('canvas-container');
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color('#2c3e50');
+
+            // 具有深度感的透視攝影機
+            camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+            camera.position.set(0, 20, 15);
+            camera.lookAt(0, 0, 0);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.shadowMap.enabled = true; // 啟用陰影增強空間感
+            renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+            container.appendChild(renderer.domElement);
+
+            // 光源設置 (環境光 + 指向光製造陰影)
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+            scene.add(ambientLight);
+
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+            directionalLight.position.set(5, 20, 10);
+            directionalLight.castShadow = true;
+            directionalLight.shadow.camera.left = -15;
+            directionalLight.shadow.camera.right = 15;
+            directionalLight.shadow.camera.top = 15;
+            directionalLight.shadow.camera.bottom = -15;
+            scene.add(directionalLight);
+
+            // ================= 2. 初始化 Cannon-es (物理世界) =================
+            world = new CANNON.World({
+                gravity: new CANNON.Vec3(0, -9.82, 0), // 初始重力 (Y軸向下)
+            });
+
+            // 物理材質：設定骰子與地面的摩擦力與彈力
+            const standardMaterial = new CANNON.Material('standard');
+            const contactMaterial = new CANNON.ContactMaterial(
+                standardMaterial,
+                standardMaterial,
+                { friction: 0.3, restitution: 0.4 } // 摩擦係數 0.3，反彈係數 0.4
+            );
+            world.addContactMaterial(contactMaterial);
+
+            // ================= 3. 創建地板與邊界 =================
+            // 視覺地板
+            const planeGeometry = new THREE.PlaneGeometry(50, 50);
+            const planeMaterial = new THREE.MeshStandardMaterial({ color: '#34495e' });
+            const planeMesh = new THREE.Mesh(planeGeometry, planeMaterial);
+            planeMesh.rotation.x = -Math.PI / 2;
+            planeMesh.receiveShadow = true;
+            scene.add(planeMesh);
+
+            // 物理地板
+            const groundBody = new CANNON.Body({
+                type: CANNON.Body.STATIC,
+                shape: new CANNON.Plane(),
+                material: standardMaterial
+            });
+            groundBody.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
+            world.addBody(groundBody);
+
+            // 建立隱形邊界牆，防止骰子掉出螢幕外
+            createInvisibleWalls(standardMaterial);
+
+            // ================= 4. 創建骰子 =================
+            const diceSize = 1.5;
+            // 視覺骰子
+            const geometry = new THREE.BoxGeometry(diceSize, diceSize, diceSize);
+            const materials = [
+                createDiceFace(1), // Right
+                createDiceFace(6), // Left
+                createDiceFace(2), // Top
+                createDiceFace(5), // Bottom
+                createDiceFace(3), // Front
+                createDiceFace(4)  // Back
+            ];
+            diceMesh = new THREE.Mesh(geometry, materials);
+            diceMesh.castShadow = true;
+            diceMesh.receiveShadow = true;
+            scene.add(diceMesh);
+
+            // 物理骰子
+            const shape = new CANNON.Box(new CANNON.Vec3(diceSize / 2, diceSize / 2, diceSize / 2));
+            diceBody = new CANNON.Body({
+                mass: 1, // 給予質量產生動量
+                shape: shape,
+                position: new CANNON.Vec3(0, 5, 0),
+                material: standardMaterial
+            });
+            // 加上一點初始旋轉阻尼，讓它滾動看起來更自然
+            diceBody.angularDamping = 0.1; 
+            world.addBody(diceBody);
+
+            // ================= 5. 事件監聽 =================
+            window.addEventListener('resize', onWindowResize);
+            window.addEventListener('touchstart', throwDice);
+            window.addEventListener('mousedown', throwDice);
+
+            lastTime = performance.now();
+            animate();
+        }
+
+        // 動態使用 Canvas 生成骰子點數貼圖
+        function createDiceFace(number) {
+            const canvas = document.createElement('canvas');
+            canvas.width = 256; canvas.height = 256;
+            const ctx = canvas.getContext('2d');
+
+            // 畫白色底色與圓角效果(用邊框模擬)
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(0, 0, 256, 256);
+            ctx.strokeStyle = '#cccccc';
+            ctx.lineWidth = 15;
+            ctx.strokeRect(0, 0, 256, 256);
+
+            // 畫點的函數
+            ctx.fillStyle = '#111111';
+            const drawDot = (x, y) => {
+                ctx.beginPath();
+                ctx.arc(x, y, 24, 0, Math.PI * 2);
+                ctx.fill();
+            };
+
+            // 根據點數排版
+            if ([1, 3, 5].includes(number)) drawDot(128, 128); // 中心點
+            if ([2, 3, 4, 5, 6].includes(number)) { drawDot(64, 64); drawDot(192, 192); } // 左上、右下
+            if ([4, 5, 6].includes(number)) { drawDot(192, 64); drawDot(64, 192); } // 右上、左下
+            if (number === 6) { drawDot(64, 128); drawDot(192, 128); } // 中左、中右
+
+            // 特別將 1 點畫大一點且標紅
+            if (number === 1) {
+                ctx.fillStyle = '#e74c3c';
+                ctx.beginPath(); ctx.arc(128, 128, 35, 0, Math.PI * 2); ctx.fill();
+            }
+
+            const texture = new THREE.CanvasTexture(canvas);
+            return new THREE.MeshStandardMaterial({ 
+                map: texture, 
+                roughness: 0.1, // 降低粗糙度讓骰子表面有光澤
+                metalness: 0.05 
+            });
+        }
+
+        // 創建隱形的物理邊界
+        function createInvisibleWalls(material) {
+            const wallThickness = 1;
+            const sizeX = 8; const sizeZ = 12;
+
+            const makeWall = (x, z, angleY) => {
+                const wallBody = new CANNON.Body({
+                    type: CANNON.Body.STATIC,
+                    shape: new CANNON.Box(new CANNON.Vec3(20, 10, wallThickness)),
+                    position: new CANNON.Vec3(x, 5, z),
+                    material: material
+                });
+                wallBody.quaternion.setFromEuler(0, angleY, 0);
+                world.addBody(wallBody);
+            };
+
+            makeWall(0, -sizeZ, 0);          // 上
+            makeWall(0, sizeZ, 0);           // 下
+            makeWall(-sizeX, 0, Math.PI / 2); // 左
+            makeWall(sizeX, 0, Math.PI / 2);  // 右
+        }
+
+        // 模擬丟骰子 (賦予隨機衝量與扭矩動量)
+        function throwDice(e) {
+            // 防止觸控時誤觸其他事件
+            if(e.type === 'touchstart') e.preventDefault(); 
+            
+            // 將骰子往上拉一點
+            diceBody.position.y += 2;
+            
+            // 設定隨機衝量 (Force)
+            const impulse = new CANNON.Vec3(
+                (Math.random() - 0.5) * 10,
+                Math.random() * 15 + 10, // 給予強烈的向上動量
+                (Math.random() - 0.5) * 10
+            );
+            diceBody.applyLocalImpulse(impulse, new CANNON.Vec3(0, 0, 0));
+
+            // 設定隨機旋轉扭矩 (Spin)
+            const torque = new CANNON.Vec3(
+                (Math.random() - 0.5) * 50,
+                (Math.random() - 0.5) * 50,
+                (Math.random() - 0.5) * 50
+            );
+            diceBody.applyTorque(torque);
+        }
+
+        // 處理手機陀螺儀資料，轉換為重力向量
+        function handleOrientation(event) {
+            const maxGravity = 19.6; // 放大重力感以增加遊戲性 (原本是 9.8)
+            
+            // beta: 前後傾斜 (-180 到 180) -> 對應 Z 軸重力
+            // gamma: 左右傾斜 (-90 到 90)  -> 對應 X 軸重力
+            let beta = event.beta || 0;
+            let gamma = event.gamma || 0;
+
+            // 限制角度避免過度翻轉
+            if (beta > 90) beta = 90;
+            if (beta < -90) beta = -90;
+
+            // 將角度轉換為弧度，並計算該方向的重力分量
+            const gravityX = Math.sin(THREE.MathUtils.degToRad(gamma)) * maxGravity;
+            const gravityZ = Math.sin(THREE.MathUtils.degToRad(beta)) * maxGravity;
+            
+            // 永遠保持一定的向下重力，確保骰子貼合地面
+            const gravityY = -9.82; 
+
+            // 即時更新物理世界的地心引力方向
+            world.gravity.set(gravityX, gravityY, gravityZ);
+            
+            // 喚醒骰子 (如果骰子靜止，物理引擎可能會使其休眠)
+            diceBody.wakeUp();
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        // 渲染與物理模擬的同步循環
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const time = performance.now();
+            const dt = (time - lastTime) / 1000;
+            lastTime = time;
+
+            // 1. 推進物理世界時間
+            if (world) world.step(1 / 60, dt, 3);
+
+            // 2. 將物理剛體(Body)的位置與旋轉同步給視覺網格(Mesh)
+            if (diceMesh && diceBody) {
+                diceMesh.position.copy(diceBody.position);
+                diceMesh.quaternion.copy(diceBody.quaternion);
+            }
+
+            // 3. 渲染畫面
+            if (renderer && scene && camera) {
+                renderer.render(scene, camera);
+            }
+        }
+
+        // 授權與啟動按鈕邏輯
+        document.getElementById('start-btn').addEventListener('click', function() {
+            // iOS 13+ 需要取得 DeviceOrientation 權限
+            if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+                DeviceOrientationEvent.requestPermission()
+                    .then(permissionState => {
+                        if (permissionState === 'granted') {
+                            window.addEventListener('deviceorientation', handleOrientation);
+                            startGame();
+                        } else {
+                            alert('需要陀螺儀權限才能體驗完整功能喔！');
+                        }
+                    })
+                    .catch(console.error);
+            } else {
+                // Android 或非 iOS 13+ 裝置直接監聽
+                window.addEventListener('deviceorientation', handleOrientation);
+                startGame();
+            }
+        });
+
+        function startGame() {
+            document.getElementById('ui-layer').style.display = 'none';
+            init();
+        }
+    </script>
+</body>
+</html>
