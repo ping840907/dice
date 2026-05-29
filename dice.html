@@ -127,7 +127,6 @@
         let lastShakeTime = 0;
         const SHAKE_THRESHOLD = 15; 
 
-        // 預先宣告四元數運算物件，提升效能
         const _zee = new THREE.Vector3(0, 0, 1);
         const _euler = new THREE.Euler();
         const _q0 = new THREE.Quaternion();
@@ -166,7 +165,7 @@
             scene.add(directionalLight);
 
             world = new CANNON.World();
-            world.gravity.set(0, -11.8, 0);
+            world.gravity.set(0, -17.7, 0);
             world.broadphase = new CANNON.NaiveBroadphase();
             world.solver.iterations = 10;
 
@@ -282,21 +281,30 @@
 
             diceBodies.forEach(body => {
                 body.wakeUp();
+                
+                // 1. 給予垂直拋升的動能
                 body.velocity.y = forceFactor * gravityDirection;
 
+                // 2. 根據水平搖晃計算滑動軌跡，給予輕微隨機散射防重疊
+                let velX = 0, velZ = 0;
                 if (accX !== undefined && accY !== undefined) {
-                    body.velocity.x = -accX * 1.5 + (Math.random() - 0.5) * 5; 
-                    body.velocity.z = accY * 1.5 + (Math.random() - 0.5) * 5;  
+                    velX = -accX * 1.5 + (Math.random() - 0.5) * 3; 
+                    velZ = accY * 1.5 + (Math.random() - 0.5) * 3;  
                 } else {
-                    body.velocity.x = (Math.random() - 0.5) * 15;
-                    body.velocity.z = (Math.random() - 0.5) * 15;
+                    velX = (Math.random() - 0.5) * 10;
+                    velZ = (Math.random() - 0.5) * 10;
                 }
+                body.velocity.x = velX;
+                body.velocity.z = velZ;
 
-                body.angularVelocity.set(
-                    (Math.random() - 0.5) * 80,
-                    (Math.random() - 0.5) * 80,
-                    (Math.random() - 0.5) * 80
-                );
+                // 3. 【核心優化】精確計算角速度，消除亂轉現象
+                // 將自轉的力道與水平搖晃度(accX, accY)直接掛鉤。
+                // 若平穩上拋 (主要為 accZ 受力)，自轉力道趨近於極微小的隨機自然翻轉。
+                let spinX = (accY || 0) * 0.8 + (Math.random() - 0.5) * 4;
+                let spinY = (Math.random() - 0.5) * 4;
+                let spinZ = (accX || 0) * 0.8 + (Math.random() - 0.5) * 4;
+
+                body.angularVelocity.set(spinX, spinY, spinZ);
             });
         }
 
@@ -320,16 +328,13 @@
             }
         }
 
-        // --- 核心進化：四元數重力運算與動態吸力 ---
         function handleOrientation(event) {
             if(!isGameStarted) return;
             
-            // 讀取包含水平旋轉的三維數據
             let alpha = event.alpha ? THREE.MathUtils.degToRad(event.alpha) : 0;
             let beta = event.beta ? THREE.MathUtils.degToRad(event.beta) : 0;
             let gamma = event.gamma ? THREE.MathUtils.degToRad(event.gamma) : 0;
 
-            // 讀取螢幕轉向(直式/橫式)
             let orient = 0;
             if (window.screen && window.screen.orientation && window.screen.orientation.angle !== undefined) {
                 orient = THREE.MathUtils.degToRad(window.screen.orientation.angle);
@@ -337,27 +342,22 @@
                 orient = THREE.MathUtils.degToRad(window.orientation);
             }
 
-            // 【黑科技 1：四元數轉換】將手機在真實世界的姿態，精準轉為 3D 空間矩陣
             _euler.set(beta, alpha, -gamma, 'YXZ');
             let quaternion = new THREE.Quaternion();
             quaternion.setFromEuler(_euler);
             quaternion.multiply(_q1);
             quaternion.multiply(_q0.setFromAxisAngle(_zee, -orient));
 
-            // 將真實世界向下 (-Y) 的重力，轉換到手機局部的 X, Y, Z 向量上
             let localGravity = _worldGravity.clone().applyQuaternion(quaternion.invert());
 
-            const maxGravity = 36.0; 
+            const maxGravity = 54.0; 
             let gravityX = localGravity.x * maxGravity;
             let gravityZ = -localGravity.y * maxGravity; 
             let gravityY = localGravity.z * maxGravity;
 
-            // 【黑科技 2：動態吸力解除卡死】
-            // 當 absZ 趨近於 0 時，代表手機越接近完全垂直(90度)。
             let absZ = Math.abs(localGravity.z); 
             
-            // 垂直時吸力降至 1.5 (剛好抵消斜面防漂浮)，平放時吸力恢復為 10.0
-            let dynamicAdhesion = 1.5 + (8.5 * absZ); 
+            let dynamicAdhesion = 2.25 + (12.75 * absZ); 
 
             const isFaceDown = localGravity.z > 0;
             gravityY += isFaceDown ? dynamicAdhesion : -dynamicAdhesion;
@@ -512,4 +512,3 @@
     </script>
 </body>
 </html>
-
