@@ -318,13 +318,14 @@
                 wallMeshes.push(mesh);
             };
             const hy = BOX_DEPTH / 2;
-            // 材質係數與骰子的係數取平均後即為接觸係數（壓克力骰子對塑膠盒 / 玻璃）
-            slab(0, -T, 0, boxHX + T, T, boxHZ + T, 0.5, 0.40, false);                  // 盒底
-            slab(0, BOX_DEPTH + T, 0, boxHX + T, T, boxHZ + T, 0.2, 0.55, false);       // 玻璃蓋
-            slab(-boxHX - T, hy, 0, T, hy, boxHZ + T, 0.4, 0.45, true);
-            slab( boxHX + T, hy, 0, T, hy, boxHZ + T, 0.4, 0.45, true);
-            slab(0, hy, -boxHZ - T, boxHX + T, hy, T, 0.4, 0.45, true);
-            slab(0, hy,  boxHZ + T, boxHX + T, hy, T, 0.4, 0.45, true);
+            // 材質係數與骰子的係數取平均後即為接觸係數。全部是硬質材料（壓克力骰子、硬盒底、玻璃）：
+            // 硬塑膠互碰的恢復係數約 0.8–0.9，摩擦低，所以會清脆地多次彈跳、翻滾
+            slab(0, -T, 0, boxHX + T, T, boxHZ + T, 0.35, 0.75, false);                  // 盒底
+            slab(0, BOX_DEPTH + T, 0, boxHX + T, T, boxHZ + T, 0.2, 0.85, false);       // 玻璃蓋
+            slab(-boxHX - T, hy, 0, T, hy, boxHZ + T, 0.3, 0.80, true);
+            slab( boxHX + T, hy, 0, T, hy, boxHZ + T, 0.3, 0.80, true);
+            slab(0, hy, -boxHZ - T, boxHX + T, hy, T, 0.3, 0.80, true);
+            slab(0, hy,  boxHZ + T, boxHX + T, hy, T, 0.3, 0.80, true);
 
             dice.forEach(d => confine(d.body, true));
         }
@@ -377,7 +378,7 @@
             // 圓角方塊碰撞體，與顯示模型完全一致；質量與轉動慣量由均勻密度的實心形狀自動算出
             const core = 0.5 - DIE_RADIUS;
             world.createCollider(RAPIER.ColliderDesc.roundCuboid(core, core, core, DIE_RADIUS)
-                .setDensity(1).setFriction(0.3).setRestitution(0.5), body);
+                .setDensity(1).setFriction(0.25).setRestitution(0.85), body);
 
             dice.push({ mesh, body, pv: new THREE.Vector3() });
         }
