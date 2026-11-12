@@ -44,6 +44,7 @@
             box-shadow: 0 4px 6px rgba(0,0,0,0.3);
             transition: transform 0.1s, background-color 0.2s;
         }
+        #start-btn:disabled { opacity: 0.5; cursor: default; }
         #start-btn:active {
             transform: scale(0.95);
             background-color: #c0392b;
@@ -86,16 +87,15 @@
     </style>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/geometries/RoundedBoxGeometry.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/cannon.js/0.6.2/cannon.min.js"></script>
 </head>
 <body>
 
     <div id="ui-layer">
         <h2>3D 重力骰子</h2>
-        <button id="start-btn">點擊開始</button>
+        <button id="start-btn" disabled>載入中…</button>
         <div id="instruction-text">
-            向上甩動手機可拋擲骰子<br>
-            全方位空間感測，無死角滾動
+            傾斜、搖晃、甩動手機，骰子依真實慣性運動<br>
+            電腦：拖曳滑鼠＝搖晃盒子，空白鍵＝甩動
         </div>
     </div>
 
@@ -106,328 +106,302 @@
 
     <div id="canvas-container"></div>
 
-    <script>
-        window.onerror = function(message, source, lineno, colno, error) {
+    <script type="module">
+        import RAPIER from 'https://cdn.jsdelivr.net/npm/@dimforge/rapier3d-compat@0.12.0/rapier.es.js';
+
+        window.onerror = function(message, source, lineno) {
             alert("程式出錯：\n" + message + "\n行號：" + lineno);
             return true;
         };
 
-        let scene, camera, renderer, world;
-        let standardMaterial;
-        
-        let diceMeshes = [];
-        let diceBodies = [];
-        
-        let lastTime;
+        // ───────────────────────── 真實尺度 ─────────────────────────
+        // 螢幕就是盒子的玻璃蓋；場景 1 單位 = 一顆骰子邊長 = DIE_SIZE_M 公尺。
+        // 所有物理量（重力、感測器加速度）都以真實 SI 數值換算進場景，不做任何手感調校。
+        const DIE_SIZE_M = 0.012;                 // 12 mm 骰子
+        const UPM = 1 / DIE_SIZE_M;               // units per meter
+        const G = 9.80665 * UPM;                  // 真實重力（場景單位 / s²）
+        const BOX_DEPTH = 4;                      // 盒深 4.8 cm
+        const DIE_RADIUS = 0.15;                  // 圓角半徑（碰撞體與模型一致）
+        const FOV = 20;
+        const CSS_PX_M = matchMedia('(pointer: coarse)').matches ? 0.000165 : 0.0002646; // 每 CSS px 的實際長度
+        const STEP = 1 / 480;                     // 真實尺度下的小物體需要高頻積分
+        const MAX_ACC = 8 * G;                    // 加速度計量程上限
+        const MAX_DICE = 30;
+
+        let scene, camera, renderer, world, dirLight;
+        let boxHX = 3, boxHZ = 6;                 // 盒內半寬 / 半高（場景單位）
+        let wallColliders = [], wallMeshes = [];
+        const dice = [];                          // { mesh, body }
+        let lastTime, accumulator = 0;
         let isGameStarted = false;
 
-        const cameraY = 22;      
-        const boxDepth = 8;      
-
-        let lastShakeTime = 0;
-        const SHAKE_THRESHOLD = 15; 
+        // ───────────────────────── 感測器狀態（螢幕座標系） ─────────────────────────
+        // 螢幕座標：x 右、y 上、z 朝向使用者。場景座標 = (x, z, -y)。
+        const sensor = {
+            hasMotion: false, hasOrient: false,
+            aIG: new THREE.Vector3(),             // accelerationIncludingGravity, m/s²
+            omega: new THREE.Vector3(),           // 角速度 rad/s
+            alpha: new THREE.Vector3(),           // 角加速度 rad/s²
+            down: new THREE.Vector3(0, 0, -1),    // 由方向感測器推得的重力方向
+            // Android: 靜止時 aIG = -g·down；iOS Safari 符號相反。先依 UA 猜，再由方向感測器自動校正。
+            sign: (/iP(hone|ad|od)/.test(navigator.userAgent) ||
+                   (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)) ? 1 : -1,
+            signEvidence: 0
+        };
+        const pointer = { dragging: false, x: 0, y: 0, t: 0, vel: new THREE.Vector3(), lastMove: 0 };
+        const boxVel = new THREE.Vector3();       // 滑鼠拖曳時虛擬盒子的速度
+        const jolt = { time: 0, acc: new THREE.Vector3() };
 
         const _zee = new THREE.Vector3(0, 0, 1);
         const _euler = new THREE.Euler();
+        const _q = new THREE.Quaternion();
         const _q0 = new THREE.Quaternion();
         const _q1 = new THREE.Quaternion(-Math.sqrt(0.5), 0, 0, Math.sqrt(0.5));
-        const _worldGravity = new THREE.Vector3(0, -1, 0);
+        const _g = new THREE.Vector3(), _w = new THREE.Vector3(), _dw = new THREE.Vector3();
+        const _r = new THREE.Vector3(), _v = new THREE.Vector3(), _a = new THREE.Vector3(), _t = new THREE.Vector3();
 
+        function screenAngle() {
+            if (window.screen && window.screen.orientation && window.screen.orientation.angle !== undefined) {
+                return THREE.MathUtils.degToRad(window.screen.orientation.angle);
+            }
+            return window.orientation !== undefined ? THREE.MathUtils.degToRad(window.orientation) : 0;
+        }
+        // 裝置座標 → 螢幕座標（繞 z 軸轉螢幕旋轉角）
+        function deviceToScreen(x, y, z, out) {
+            const th = screenAngle(), c = Math.cos(th), s = Math.sin(th);
+            return out.set(x * c - y * s, x * s + y * c, z);
+        }
+        // 螢幕座標 → 場景座標
+        function screenToScene(v, out) { return out.set(v.x, v.z, -v.y); }
+
+        function handleMotion(event) {
+            const a = event.accelerationIncludingGravity;
+            if (!a || a.x === null || a.x === undefined) return;
+            deviceToScreen(a.x, a.y, a.z, sensor.aIG);
+            sensor.hasMotion = true;
+
+            const rr = event.rotationRate;
+            if (rr && rr.alpha !== null && rr.alpha !== undefined) {
+                // W3C：alpha 繞 z、beta 繞 x、gamma 繞 y，單位 deg/s
+                const k = Math.PI / 180;
+                deviceToScreen(rr.beta * k, rr.gamma * k, rr.alpha * k, _t);
+                _t.clampLength(0, 35);
+                const dt = Math.max(event.interval > 1 ? event.interval / 1000 : event.interval || 0.016, 0.004);
+                _dw.subVectors(_t, sensor.omega).divideScalar(dt).clampLength(0, 600);
+                sensor.alpha.lerp(_dw, 0.35);     // 微分會放大雜訊，做低通
+                sensor.omega.copy(_t);
+            }
+
+            if (sensor.hasOrient) {
+                sensor.signEvidence = sensor.signEvidence * 0.95 + sensor.aIG.dot(sensor.down);
+                if (Math.abs(sensor.signEvidence) > 40) sensor.sign = sensor.signEvidence > 0 ? 1 : -1;
+            }
+        }
+
+        function handleOrientation(event) {
+            if (event.beta === null || event.beta === undefined) return;
+            const alpha = event.alpha ? THREE.MathUtils.degToRad(event.alpha) : 0;
+            const beta = THREE.MathUtils.degToRad(event.beta);
+            const gamma = event.gamma ? THREE.MathUtils.degToRad(event.gamma) : 0;
+            _euler.set(beta, alpha, -gamma, 'YXZ');
+            _q.setFromEuler(_euler).multiply(_q1).multiply(_q0.setFromAxisAngle(_zee, -screenAngle()));
+            sensor.down.set(0, -1, 0).applyQuaternion(_q.invert());
+            sensor.hasOrient = true;
+        }
+
+        // 盒子參考系中的等效重力：g_eff = g − a_box。
+        // 加速度計量到的正是 (a_box − g)（比力），所以 g_eff = −aIG，傾斜、搖晃、甩動全部自然涵蓋。
+        function effectiveGravity(dt, out) {
+            if (sensor.hasMotion) {
+                screenToScene(sensor.aIG, out).multiplyScalar(sensor.sign * UPM);
+            } else if (sensor.hasOrient) {
+                screenToScene(sensor.down, out).multiplyScalar(G);
+            } else {
+                out.set(0, -G, 0);
+            }
+
+            // 滑鼠 / 觸控拖曳：把指標運動當成盒子的運動，其加速度以慣性力作用在骰子上
+            const now = performance.now();
+            if (!pointer.dragging || now - pointer.lastMove > 60) pointer.vel.set(0, 0, 0);
+            _t.copy(boxVel);
+            boxVel.lerp(pointer.vel, 1 - Math.exp(-dt / 0.03));
+            _t.sub(boxVel).divideScalar(dt);      // −a_box
+            out.add(_t.clampLength(0, 6 * G));
+
+            if (jolt.time > 0) { out.add(jolt.acc); jolt.time -= dt; }
+            return out.clampLength(0, MAX_ACC);
+        }
+
+        function triggerJolt() {
+            // 模擬手把盒子往上甩後急停：約 3.5 g、45 ms，手不會完全垂直所以帶一點側向分量
+            jolt.time = 0.045;
+            jolt.acc.set((Math.random() - 0.5) * 1.6 * G, 3.5 * G, (Math.random() - 0.5) * 1.6 * G);
+        }
+
+        // ───────────────────────── 場景 ─────────────────────────
         function init() {
             const container = document.getElementById('canvas-container');
-            const aspect = window.innerWidth / window.innerHeight;
 
             scene = new THREE.Scene();
             scene.background = new THREE.Color('#0d1117');
 
-            camera = new THREE.PerspectiveCamera(35, aspect, 0.1, 100);
-            camera.position.set(0, cameraY, 0); 
-            camera.lookAt(0, 0, 0);
+            camera = new THREE.PerspectiveCamera(FOV, 1, 1, 1000);
+            camera.up.set(0, 0, -1);
 
             renderer = new THREE.WebGLRenderer({ antialias: true });
-            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
             renderer.shadowMap.enabled = true;
-            renderer.shadowMap.type = THREE.PCFSoftShadowMap; 
+            renderer.shadowMap.type = THREE.PCFSoftShadowMap;
             container.appendChild(renderer.domElement);
 
-            const ambientLight = new THREE.AmbientLight(0xffffff, 0.65);
-            scene.add(ambientLight);
+            scene.add(new THREE.AmbientLight(0xffffff, 0.65));
+            dirLight = new THREE.DirectionalLight(0xffffff, 0.7);
+            dirLight.position.set(8, 40, 5);
+            dirLight.castShadow = true;
+            dirLight.shadow.mapSize.set(2048, 2048);
+            dirLight.shadow.camera.near = 1;
+            dirLight.shadow.camera.far = 120;
+            scene.add(dirLight);
 
-            const directionalLight = new THREE.DirectionalLight(0xffffff, 0.7);
-            directionalLight.position.set(10, 20, 5);
-            directionalLight.castShadow = true;
-            directionalLight.shadow.camera.left = -25;
-            directionalLight.shadow.camera.right = 25;
-            directionalLight.shadow.camera.top = 25;
-            directionalLight.shadow.camera.bottom = -25;
-            directionalLight.shadow.mapSize.width = 1024;
-            directionalLight.shadow.mapSize.height = 1024;
-            scene.add(directionalLight);
-
-            world = new CANNON.World();
-            world.gravity.set(0, -17.7, 0);
-            world.broadphase = new CANNON.NaiveBroadphase();
-            world.solver.iterations = 10;
-
-            standardMaterial = new CANNON.Material('standard');
-            
-            const universalContact = new CANNON.ContactMaterial(
-                standardMaterial,
-                standardMaterial,
-                { friction: 0.003, restitution: 0.55 } 
+            const floor = new THREE.Mesh(
+                new THREE.PlaneGeometry(400, 400),
+                new THREE.MeshStandardMaterial({ color: '#1e272e', roughness: 0.9 })
             );
-            world.addContactMaterial(universalContact);
+            floor.rotation.x = -Math.PI / 2;
+            floor.receiveShadow = true;
+            scene.add(floor);
 
-            const planeGeometry = new THREE.PlaneGeometry(100, 100);
-            const planeMaterial = new THREE.MeshStandardMaterial({ color: '#1e272e', roughness: 0.9 });
-            const planeMesh = new THREE.Mesh(planeGeometry, planeMaterial);
-            planeMesh.rotation.x = -Math.PI / 2;
-            planeMesh.receiveShadow = true;
-            scene.add(planeMesh);
+            world = new RAPIER.World({ x: 0, y: -G, z: 0 });
+            world.timestep = STEP;
 
-            const groundBody = new CANNON.Body({ mass: 0, material: standardMaterial });
-            groundBody.addShape(new CANNON.Plane());
-            groundBody.quaternion.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), -Math.PI / 2);
-            world.addBody(groundBody);
-
-            const ceilingBody = new CANNON.Body({ mass: 0, material: standardMaterial });
-            ceilingBody.addShape(new CANNON.Plane());
-            ceilingBody.quaternion.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), Math.PI / 2); 
-            ceilingBody.position.set(0, boxDepth, 0);
-            world.addBody(ceilingBody);
-
-            updateWallas(standardMaterial);
-
+            layout();
             addDice();
 
-            window.addEventListener('resize', onWindowResize);
-
+            window.addEventListener('resize', layout);
             lastTime = performance.now();
             animate();
         }
 
-        function addDice() {
-            const diceSize = 1.0; 
-            const cornerRadius = 0.15; 
-            const cornerSegments = 5;  
+        // 依螢幕實際大小決定盒子：玻璃蓋（y = BOX_DEPTH）剛好等於可視範圍，牆面垂直。
+        function layout() {
+            const w = window.innerWidth, h = window.innerHeight;
+            boxHZ = h * CSS_PX_M * UPM / 2;
+            boxHX = boxHZ * (w / h);
 
-            const geometry = new THREE.RoundedBoxGeometry(diceSize, diceSize, diceSize, cornerSegments, cornerRadius);
+            camera.aspect = w / h;
+            camera.position.set(0, BOX_DEPTH + boxHZ / Math.tan(THREE.MathUtils.degToRad(FOV / 2)), 0);
+            camera.lookAt(0, 0, 0);
+            camera.updateProjectionMatrix();
+            renderer.setSize(w, h);
+
+            const m = Math.max(boxHX, boxHZ) + 3;
+            const sc = dirLight.shadow.camera;
+            sc.left = -m; sc.right = m; sc.top = m; sc.bottom = -m;
+            sc.updateProjectionMatrix();
+
+            wallColliders.forEach(c => world.removeCollider(c, true));
+            wallMeshes.forEach(mesh => { scene.remove(mesh); mesh.geometry.dispose(); });
+            wallColliders = []; wallMeshes = [];
+
+            const T = 10;                         // 牆厚（防穿透）
+            const wallMat = layout.wallMat || (layout.wallMat =
+                new THREE.MeshStandardMaterial({ color: '#2f3b45', roughness: 0.8 }));
+            const slab = (x, y, z, hx, hy, hz, friction, restitution, visible) => {
+                wallColliders.push(world.createCollider(
+                    RAPIER.ColliderDesc.cuboid(hx, hy, hz).setTranslation(x, y, z)
+                        .setFriction(friction).setRestitution(restitution)));
+                if (!visible) return;
+                const mesh = new THREE.Mesh(new THREE.BoxGeometry(hx * 2, hy * 2, hz * 2), wallMat);
+                mesh.position.set(x, y, z);
+                mesh.receiveShadow = true;
+                scene.add(mesh);
+                wallMeshes.push(mesh);
+            };
+            const hy = BOX_DEPTH / 2;
+            // 材質係數與骰子的係數取平均後即為接觸係數（壓克力骰子對塑膠盒 / 玻璃）
+            slab(0, -T, 0, boxHX + T, T, boxHZ + T, 0.5, 0.40, false);                  // 盒底
+            slab(0, BOX_DEPTH + T, 0, boxHX + T, T, boxHZ + T, 0.2, 0.55, false);       // 玻璃蓋
+            slab(-boxHX - T, hy, 0, T, hy, boxHZ + T, 0.4, 0.45, true);
+            slab( boxHX + T, hy, 0, T, hy, boxHZ + T, 0.4, 0.45, true);
+            slab(0, hy, -boxHZ - T, boxHX + T, hy, T, 0.4, 0.45, true);
+            slab(0, hy,  boxHZ + T, boxHX + T, hy, T, 0.4, 0.45, true);
+
+            dice.forEach(d => confine(d.body, true));
+        }
+
+        // 安全網：若骰子因視窗縮放或數值問題跑到盒外，放回盒內
+        function confine(body, force) {
+            const p = body.translation();
+            const lx = boxHX - 0.5, lz = boxHZ - 0.5;
+            const bad = !isFinite(p.x + p.y + p.z);
+            const out = Math.abs(p.x) > lx + 0.6 || Math.abs(p.z) > lz + 0.6 || p.y < -0.6 || p.y > BOX_DEPTH + 0.6;
+            if (!bad && !out && !force) return;
+            if (!bad && !out && Math.abs(p.x) <= lx && Math.abs(p.z) <= lz) return;
+            body.setTranslation({
+                x: bad ? 0 : THREE.MathUtils.clamp(p.x, -lx, lx),
+                y: bad ? BOX_DEPTH / 2 : THREE.MathUtils.clamp(p.y, 0.5, BOX_DEPTH - 0.5),
+                z: bad ? 0 : THREE.MathUtils.clamp(p.z, -lz, lz)
+            }, true);
+            if (bad || out) { body.setLinvel({ x: 0, y: 0, z: 0 }, true); body.setAngvel({ x: 0, y: 0, z: 0 }, true); }
+        }
+
+        function addDice() {
+            if (dice.length >= MAX_DICE) return;
+            const geometry = new THREE.RoundedBoxGeometry(1, 1, 1, 5, DIE_RADIUS);
             const materials = [
                 createDiceFace(1), createDiceFace(6),
                 createDiceFace(2), createDiceFace(5),
                 createDiceFace(3), createDiceFace(4)
             ];
-            
             const mesh = new THREE.Mesh(geometry, materials);
             mesh.castShadow = true;
+            mesh.receiveShadow = true;
             scene.add(mesh);
-            diceMeshes.push(mesh);
 
-            const body = new CANNON.Body({ mass: 1, material: standardMaterial });
-            body.addShape(new CANNON.Box(new CANNON.Vec3(diceSize / 2, diceSize / 2, diceSize / 2)));
-            
-            const offsetX = (Math.random() - 0.5) * 4;
-            const offsetZ = (Math.random() - 0.5) * 4;
-            body.position.set(offsetX, 1.5 + diceBodies.length, offsetZ); 
-            
-            body.updateMassProperties(); 
-            const rollFactor = 0.5; 
-            body.inertia.set(
-                body.inertia.x * rollFactor,
-                body.inertia.y * rollFactor,
-                body.inertia.z * rollFactor
-            );
-            body.invInertia.set(
-                1 / body.inertia.x,
-                1 / body.inertia.y,
-                1 / body.inertia.z
-            );
+            // 找一個不與其他骰子重疊的位置
+            let x = 0, y = 0, z = 0;
+            for (let tries = 0; tries < 40; tries++) {
+                x = (Math.random() * 2 - 1) * Math.max(boxHX - 0.9, 0);
+                z = (Math.random() * 2 - 1) * Math.max(boxHZ - 0.9, 0);
+                y = 0.9 + Math.random() * (BOX_DEPTH - 1.8);
+                if (dice.every(d => { const p = d.body.translation(); return Math.hypot(p.x - x, p.y - y, p.z - z) > 1.8; })) break;
+            }
+            _q.setFromEuler(_euler.set(Math.random() * 6.28, Math.random() * 6.28, Math.random() * 6.28, 'XYZ'));
 
-            body.angularDamping = 0.05;  
-            body.linearDamping = 0.005;  
-            world.addBody(body);
-            diceBodies.push(body);
+            const body = world.createRigidBody(RAPIER.RigidBodyDesc.dynamic()
+                .setTranslation(x, y, z)
+                .setRotation({ x: _q.x, y: _q.y, z: _q.z, w: _q.w })
+                .setCcdEnabled(true)              // 連續碰撞偵測：高速甩動也不會穿牆
+                .setCanSleep(false)               // 重力方向隨時在變，不休眠
+                .setLinearDamping(0).setAngularDamping(0));
+            // 圓角方塊碰撞體，與顯示模型完全一致；質量與轉動慣量由均勻密度的實心形狀自動算出
+            const core = 0.5 - DIE_RADIUS;
+            world.createCollider(RAPIER.ColliderDesc.roundCuboid(core, core, core, DIE_RADIUS)
+                .setDensity(1).setFriction(0.3).setRestitution(0.5), body);
 
-            body.addEventListener('collide', function(e) {
-                if (!navigator.vibrate) return;
-                const impactVelocity = Math.abs(e.contact.getImpactVelocityAlongNormal());
-                if (impactVelocity > 15.0) {
-                    navigator.vibrate(40);
-                } else if (impactVelocity > 2.0) {
-                    navigator.vibrate(10);
-                }
-            });
+            dice.push({ mesh, body, pv: new THREE.Vector3() });
         }
 
         function removeDice() {
-            if (diceBodies.length <= 1) return; 
-            
-            const body = diceBodies.pop();
-            const mesh = diceMeshes.pop();
-            
-            world.removeBody(body);
-            scene.remove(mesh);
-            
-            mesh.geometry.dispose();
-            mesh.material.forEach(m => {
-                if(m.map) m.map.dispose();
-                m.dispose();
-            });
-        }
-
-        function tossDice(intensity, accX, accY, accZ) {
-            const forceFactor = THREE.MathUtils.clamp(intensity * 1.5, 15, 50);
-            const gravityDirection = world.gravity.y > 0 ? -1 : 1; 
-
-            diceBodies.forEach(body => {
-                body.wakeUp();
-                
-                // 1. 給予垂直拋升的動能
-                body.velocity.y = forceFactor * gravityDirection;
-
-                // 2. 根據水平搖晃計算滑動軌跡，給予輕微隨機散射防重疊
-                let velX = 0, velZ = 0;
-                if (accX !== undefined && accY !== undefined) {
-                    velX = -accX * 1.5 + (Math.random() - 0.5) * 3; 
-                    velZ = accY * 1.5 + (Math.random() - 0.5) * 3;  
-                } else {
-                    velX = (Math.random() - 0.5) * 10;
-                    velZ = (Math.random() - 0.5) * 10;
-                }
-                body.velocity.x = velX;
-                body.velocity.z = velZ;
-
-                // 3. 【核心優化】精確計算角速度，消除亂轉現象
-                // 將自轉的力道與水平搖晃度(accX, accY)直接掛鉤。
-                // 若平穩上拋 (主要為 accZ 受力)，自轉力道趨近於極微小的隨機自然翻轉。
-                let spinX = (accY || 0) * 0.8 + (Math.random() - 0.5) * 4;
-                let spinY = (Math.random() - 0.5) * 4;
-                let spinZ = (accX || 0) * 0.8 + (Math.random() - 0.5) * 4;
-
-                body.angularVelocity.set(spinX, spinY, spinZ);
-            });
-        }
-
-        function handleMotion(event) {
-            if(!isGameStarted) return;
-
-            let acc = event.acceleration;
-            if (!acc || acc.x === null) {
-                acc = event.accelerationIncludingGravity;
-            }
-            if (!acc) return;
-
-            const accMagnitude = Math.sqrt(acc.x * acc.x + acc.y * acc.y + acc.z * acc.z);
-
-            if (accMagnitude > SHAKE_THRESHOLD) {
-                const currentTime = performance.now();
-                if (currentTime - lastShakeTime > 400) {
-                    lastShakeTime = currentTime;
-                    tossDice(accMagnitude, acc.x, acc.y, acc.z);
-                }
-            }
-        }
-
-        function handleOrientation(event) {
-            if(!isGameStarted) return;
-            
-            let alpha = event.alpha ? THREE.MathUtils.degToRad(event.alpha) : 0;
-            let beta = event.beta ? THREE.MathUtils.degToRad(event.beta) : 0;
-            let gamma = event.gamma ? THREE.MathUtils.degToRad(event.gamma) : 0;
-
-            let orient = 0;
-            if (window.screen && window.screen.orientation && window.screen.orientation.angle !== undefined) {
-                orient = THREE.MathUtils.degToRad(window.screen.orientation.angle);
-            } else if (window.orientation !== undefined) {
-                orient = THREE.MathUtils.degToRad(window.orientation);
-            }
-
-            _euler.set(beta, alpha, -gamma, 'YXZ');
-            let quaternion = new THREE.Quaternion();
-            quaternion.setFromEuler(_euler);
-            quaternion.multiply(_q1);
-            quaternion.multiply(_q0.setFromAxisAngle(_zee, -orient));
-
-            let localGravity = _worldGravity.clone().applyQuaternion(quaternion.invert());
-
-            const maxGravity = 54.0; 
-            let gravityX = localGravity.x * maxGravity;
-            let gravityZ = -localGravity.y * maxGravity; 
-            let gravityY = localGravity.z * maxGravity;
-
-            let absZ = Math.abs(localGravity.z); 
-            
-            let dynamicAdhesion = 2.25 + (12.75 * absZ); 
-
-            const isFaceDown = localGravity.z > 0;
-            gravityY += isFaceDown ? dynamicAdhesion : -dynamicAdhesion;
-
-            if (world) {
-                world.gravity.set(gravityX, gravityY, gravityZ);
-                diceBodies.forEach(body => {
-                    if (body.sleepState === CANNON.Body.SLEEPING) body.wakeUp();
-                });
-            }
-        }
-
-        function updateWallas(material) {
-            if(world) {
-                const bodiesToRemove = world.bodies.filter(b => b.isWall);
-                bodiesToRemove.forEach(b => world.removeBody(b));
-            }
-            
-            const vFovRad = THREE.MathUtils.degToRad(camera.fov);
-            const distToMid = camera.position.y - (boxDepth / 2);
-
-            const hz_mid = Math.tan(vFovRad / 2) * distToMid;
-            const hx_mid = hz_mid * camera.aspect;
-
-            const angleZ = vFovRad / 2; 
-            const angleX = Math.atan(Math.tan(vFovRad / 2) * camera.aspect); 
-
-            const wallThickness = 4; 
-            const extraLength = 5;   
-
-            const wallHeightZ = boxDepth / Math.cos(angleZ);
-            const wallHeightX = boxDepth / Math.cos(angleX);
-
-            const makeWall = (x, y, z, hx, hy, hz, axis, angle) => {
-                const wallBody = new CANNON.Body({ mass: 0, material: material });
-                wallBody.addShape(new CANNON.Box(new CANNON.Vec3(hx, hy, hz)));
-                wallBody.position.set(x, y, z);
-                wallBody.quaternion.setFromAxisAngle(axis, angle);
-                wallBody.isWall = true; 
-                world.addBody(wallBody);
-            };
-
-            makeWall(0, boxDepth / 2, -hz_mid - wallThickness/2, 
-                     hx_mid + extraLength, wallHeightZ / 2, wallThickness / 2, 
-                     new CANNON.Vec3(1, 0, 0), angleZ);
-
-            makeWall(0, boxDepth / 2, hz_mid + wallThickness/2, 
-                     hx_mid + extraLength, wallHeightZ / 2, wallThickness / 2, 
-                     new CANNON.Vec3(1, 0, 0), -angleZ);
-
-            makeWall(-hx_mid - wallThickness/2, boxDepth / 2, 0, 
-                     wallThickness / 2, wallHeightX / 2, hz_mid + extraLength, 
-                     new CANNON.Vec3(0, 0, 1), -angleX);
-
-            makeWall(hx_mid + wallThickness/2, boxDepth / 2, 0, 
-                     wallThickness / 2, wallHeightX / 2, hz_mid + extraLength, 
-                     new CANNON.Vec3(0, 0, 1), angleX);
+            if (dice.length <= 1) return;
+            const d = dice.pop();
+            world.removeRigidBody(d.body);
+            scene.remove(d.mesh);
+            d.mesh.geometry.dispose();
+            d.mesh.material.forEach(m => { if (m.map) m.map.dispose(); m.dispose(); });
         }
 
         function createDiceFace(number) {
             const canvas = document.createElement('canvas');
             canvas.width = 256; canvas.height = 256;
             const ctx = canvas.getContext('2d');
-            
+
             ctx.fillStyle = '#f5f6fa';
             ctx.fillRect(0, 0, 256, 256);
             ctx.strokeStyle = '#dcdde1';
             ctx.lineWidth = 12;
             ctx.strokeRect(0, 0, 256, 256);
-            
+
             ctx.fillStyle = '#2f3640';
             const drawDot = (x, y) => { ctx.beginPath(); ctx.arc(x, y, 26, 0, Math.PI * 2); ctx.fill(); };
             if ([1, 3, 5].includes(number)) drawDot(128, 128);
@@ -435,41 +409,114 @@
             if ([4, 5, 6].includes(number)) { drawDot(186, 70); drawDot(70, 186); }
             if (number === 6) { drawDot(70, 128); drawDot(186, 128); }
             if (number === 1) { ctx.fillStyle = '#c23616'; ctx.beginPath(); ctx.arc(128, 128, 38, 0, Math.PI * 2); ctx.fill(); }
-            
+
             const texture = new THREE.CanvasTexture(canvas);
-            texture.magFilter = THREE.LinearFilter; 
+            texture.magFilter = THREE.LinearFilter;
             texture.minFilter = THREE.LinearMipMapLinearFilter;
             return new THREE.MeshStandardMaterial({ map: texture, roughness: 0.15, metalness: 0.05 });
         }
 
-        function onWindowResize() {
-            camera.aspect = window.innerWidth / window.innerHeight;
-            camera.updateProjectionMatrix();
-            renderer.setSize(window.innerWidth, window.innerHeight);
-            updateWallas(standardMaterial);
+        // ───────────────────────── 物理步進 ─────────────────────────
+        let frameImpact = 0, lastVibrate = 0;
+
+        function substep(h) {
+            effectiveGravity(h, _g);
+            world.gravity = { x: _g.x, y: _g.y, z: _g.z };
+
+            // 盒子在轉動時是旋轉參考系：補上離心力、科氏力、尤拉力，
+            // 以及骰子自轉在旋轉系中的視變化（自由飛行的骰子在慣性系中保持自轉）。
+            screenToScene(sensor.omega, _w);
+            screenToScene(sensor.alpha, _dw);
+            const rotating = _w.lengthSq() > 0.0004 || _dw.lengthSq() > 0.25;
+
+            for (const d of dice) {
+                const b = d.body;
+                const v = b.linvel();
+                if (rotating) {
+                    const p = b.translation();
+                    _r.set(p.x, p.y - BOX_DEPTH / 2, p.z);
+                    _v.set(v.x, v.y, v.z);
+                    _a.crossVectors(_r, _dw);                                  // −Ω̇ × r
+                    _a.add(_t.crossVectors(_w, _r).cross(_w));                 // −Ω × (Ω × r)
+                    _a.addScaledVector(_t.crossVectors(_v, _w), 2);            // −2Ω × v
+                    _a.clampLength(0, MAX_ACC);
+                    _v.addScaledVector(_a, h);
+                    b.setLinvel({ x: _v.x, y: _v.y, z: _v.z }, true);
+
+                    const av = b.angvel();
+                    _r.set(av.x, av.y, av.z);
+                    _a.crossVectors(_r, _w).sub(_dw);                          // −Ω × ω − Ω̇
+                    _r.addScaledVector(_a, h);
+                    b.setAngvel({ x: _r.x, y: _r.y, z: _r.z }, true);
+                    d.pv.copy(_v);
+                } else {
+                    d.pv.set(v.x, v.y, v.z);
+                }
+            }
+
+            world.step();
+
+            // 以「非重力造成的速度突變」當作撞擊強度（m/s），供觸覺回饋使用
+            for (const d of dice) {
+                const v = d.body.linvel();
+                const dv = Math.hypot(v.x - d.pv.x - _g.x * h, v.y - d.pv.y - _g.y * h, v.z - d.pv.z - _g.z * h) / UPM;
+                if (dv > frameImpact) frameImpact = dv;
+                confine(d.body, false);
+            }
         }
 
         function animate() {
             requestAnimationFrame(animate);
             const time = performance.now();
-            const dt = (time - lastTime) / 1000;
+            const dt = Math.min((time - lastTime) / 1000, 1 / 20);
             lastTime = time;
 
-            if (world && isGameStarted) {
-                world.step(1 / 60, dt, 5); 
+            if (isGameStarted) {
+                accumulator += dt;
+                while (accumulator >= STEP) { substep(STEP); accumulator -= STEP; }
+
+                if (navigator.vibrate && time - lastVibrate > 40) {
+                    if (frameImpact > 1.0) { navigator.vibrate(30); lastVibrate = time; }
+                    else if (frameImpact > 0.12) { navigator.vibrate(8); lastVibrate = time; }
+                }
+                frameImpact = 0;
             }
 
-            for (let i = 0; i < diceBodies.length; i++) {
-                diceMeshes[i].position.copy(diceBodies[i].position);
-                diceMeshes[i].quaternion.copy(diceBodies[i].quaternion);
+            for (const d of dice) {
+                const p = d.body.translation(), q = d.body.rotation();
+                d.mesh.position.set(p.x, p.y, p.z);
+                d.mesh.quaternion.set(q.x, q.y, q.z, q.w);
             }
-
-            if (renderer && scene && camera) {
-                renderer.render(scene, camera);
-            }
+            renderer.render(scene, camera);
         }
 
-        document.getElementById('start-btn').addEventListener('click', async function() {
+        // ───────────────────────── 輸入與啟動 ─────────────────────────
+        const canvasContainer = document.getElementById('canvas-container');
+        canvasContainer.addEventListener('pointerdown', e => {
+            pointer.dragging = true; pointer.x = e.clientX; pointer.y = e.clientY;
+            pointer.t = performance.now(); pointer.vel.set(0, 0, 0);
+        });
+        window.addEventListener('pointermove', e => {
+            if (!pointer.dragging) return;
+            const now = performance.now(), dt = Math.max((now - pointer.t) / 1000, 0.002);
+            const k = CSS_PX_M * UPM / dt;
+            pointer.vel.set((e.clientX - pointer.x) * k, 0, (e.clientY - pointer.y) * k);
+            pointer.x = e.clientX; pointer.y = e.clientY; pointer.t = now; pointer.lastMove = now;
+        });
+        const endDrag = () => { pointer.dragging = false; };
+        window.addEventListener('pointerup', endDrag);
+        window.addEventListener('pointercancel', endDrag);
+        window.addEventListener('keydown', e => {
+            if (e.code === 'Space' && isGameStarted) { e.preventDefault(); triggerJolt(); }
+        });
+
+        const startBtn = document.getElementById('start-btn');
+        RAPIER.init().then(() => {
+            startBtn.disabled = false;
+            startBtn.textContent = '點擊開始';
+        }).catch(err => { startBtn.textContent = '物理引擎載入失敗'; console.error(err); });
+
+        startBtn.addEventListener('click', async function() {
             const uiLayer = document.getElementById('ui-layer');
             try { init(); } catch (err) { alert("初始化失敗：" + err.message); return; }
 
@@ -496,19 +543,14 @@
                 uiLayer.style.display = 'none';
                 document.getElementById('controls').style.display = 'flex';
             }, 500);
-            
+
             isGameStarted = true;
-        });
+        }, { once: true });
 
-        document.getElementById('add-dice-btn').addEventListener('click', function(e) {
-            e.stopPropagation(); 
-            addDice();
-        });
+        document.getElementById('add-dice-btn').addEventListener('click', e => { e.stopPropagation(); addDice(); });
+        document.getElementById('remove-dice-btn').addEventListener('click', e => { e.stopPropagation(); removeDice(); });
 
-        document.getElementById('remove-dice-btn').addEventListener('click', function(e) {
-            e.stopPropagation();
-            removeDice();
-        });
+        window.__dice = { dice, sensor, get box() { return { hx: boxHX, hz: boxHZ, depth: BOX_DEPTH }; }, G, UPM };
     </script>
 </body>
 </html>
